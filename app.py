@@ -10,14 +10,14 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 # Configuração da página
 st.set_page_config(
-    page_title="Extrator Total Bank - Relatório de Títulos",
+    page_title="Extrator Total Bank - Relatório Dinâmico",
     page_icon="📊",
     layout="wide",
 )
 
 st.title("📊 Extrator & Conciliador de Títulos - Total Bank")
 st.markdown(
-    "Faça o upload do relatório em PDF para extrair os dados e gerar o novo PDF com o resumo de liquidações."
+    "Faça o upload do relatório em PDF para extrair os dados dinamicamente e gerar o relatório corporativo."
 )
 
 uploaded_file = st.file_uploader(
@@ -25,64 +25,121 @@ uploaded_file = st.file_uploader(
 )
 
 
-def parse_totalbank_pdf(pdf_file):
-    """Realiza o parse dos dados do PDF do Total Bank."""
-    beneficiario = "ASSOCIACAO DOS LOJISTAS DO ITA SHOPPING CENTRO-RATEIO"
+def extract_data_from_pdf(pdf_file):
+    """Lê dinamicamente as páginas do PDF do Total Bank e extrai os títulos por Regex."""
+    full_text = ""
+    beneficiario = "NÃO IDENTIFICADO"
 
-    # Dados extraídos do arquivo do Total Bank
-    blocks = [
-        {
-            "Ocorrência": "06-Liquidação",
-            "Data Ocorrência": "03/08/2026",
-            "Pagador": "DROGARIA",
-            "CPF/CNPJ": "24.241.375/0001-01",
-            "Uso da Empresa": "LOJA-26-A",
-            "Data Vencimento": "05/08/2026",
-            "Data Crédito": "05/08/2026",
-            "Valor Crédito": "R$ 3.807,48",
-            "Valor Documento": "R$ 3.807,48",
-        },
-        {
-            "Ocorrência": "02-Entrada Confirmada",
-            "Data Ocorrência": "03/08/2026",
-            "Pagador": "ADMCENTER COBRANCA",
-            "CPF/CNPJ": "22.743.649/0001-35",
-            "Uso da Empresa": "CLARICELL",
-            "Data Vencimento": "07/08/2026",
-            "Data Crédito": "-",
-            "Valor Crédito": "R$ 0,00",
-            "Valor Documento": "R$ 4.621,43",
-        },
-        {
-            "Ocorrência": "45-Alteração de Dados",
-            "Data Ocorrência": "03/08/2026",
-            "Pagador": "SANZITO",
-            "CPF/CNPJ": "03.146.478/0001-12",
-            "Uso da Empresa": "LOJA-28",
-            "Data Vencimento": "11/08/2026",
-            "Data Crédito": "-",
-            "Valor Crédito": "R$ 0,00",
-            "Valor Documento": "R$ 13.991,97",
-        },
-        {
-            "Ocorrência": "28-Débito de Tarifas/Custas",
-            "Data Ocorrência": "03/08/2026",
-            "Pagador": "-",
-            "CPF/CNPJ": "-",
-            "Uso da Empresa": "-",
-            "Data Vencimento": "-",
-            "Data Crédito": "03/08/2026",
-            "Valor Crédito": "R$ 0,00",
-            "Valor Documento": "R$ 0,00",
-        },
-    ]
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                full_text += text + "\n"
 
-    df = pd.DataFrame(blocks)
+    # Captura o nome do Beneficiário
+    match_ben = re.search(r"Beneficiário:\s*(.*)", full_text)
+    if match_ben:
+        beneficiario = match_ben.group(1).strip()
+
+    # Divide o texto por blocos de ocorrência
+    lines = [line.strip() for line in full_text.split("\n") if line.strip()]
+    records = []
+    
+    current_block = []
+    for line in lines:
+        # Padrão de início de título (ex: 06-Liquidação, 02-Entrada Confirmada, etc)
+        if re.match(r"^\d{2}-", line):
+            if current_block:
+                parsed = parse_single_block("\n".join(current_block))
+                if parsed:
+                    records.append(parsed)
+                current_block = []
+        current_block.append(line)
+    
+    if current_block:
+        parsed = parse_single_block("\n".join(current_block))
+        if parsed:
+            records.append(parsed)
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        df = pd.DataFrame(columns=[
+            "Ocorrência", "Data Ocorrência", "Pagador", "CPF/CNPJ", 
+            "Uso da Empresa", "Data Vencimento", "Data Crédito", 
+            "Valor Crédito", "Valor Documento"
+        ])
+        
     return df, beneficiario
 
 
+def parse_single_block(block_text):
+    """Extrai os campos específicos de um bloco individual de título."""
+    # Ignora blocos de totalização/resumo
+    if "Resumo da ocorrência" in block_text or "Totais para este filtro" in block_text:
+        return None
+
+    lines = [l.strip() for l in block_text.split("\n") if l.strip()]
+    
+    ocorrencia = lines[0] if len(lines) > 0 else "-"
+    
+    # Extrai CNPJ/CPF se houver
+    cnpj_match = re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2}", block_text)
+    cpf_cnpj = cnpj_match.group(0) if cnpj_match else "-"
+
+    # Extrai Datas (dd/mm/aaaa)
+    dates = re.findall(r"\b\d{2}/\d{2}/\d{4}\b", block_text)
+    dt_ocorrencia = dates[0] if len(dates) > 0 else "-"
+    dt_vencimento = dates[1] if len(dates) > 1 else "-"
+    dt_credito = dates[2] if len(dates) > 2 else "-"
+
+    # Extrai Valores Monetários (R$ X.XXX,XX ou R$ X,XX)
+    values = re.findall(r"R\$\s*[\d\.]+\,\d{2}", block_text)
+    
+    # Mapeamento dinâmico dos valores
+    valor_credito = "R$ 0,00"
+    valor_doc = "R$ 0,00"
+
+    if "Liquidação" in ocorrencia:
+        if len(values) >= 2:
+            valor_credito = values[-2]
+            valor_doc = values[-1]
+        elif len(values) == 1:
+            valor_credito = values[0]
+            valor_doc = values[0]
+    else:
+        if len(values) >= 1:
+            valor_doc = values[-1]
+
+    # Extrai Pagador e Uso Empresa com base na estrutura de linhas
+    pagador = "-"
+    uso_empresa = "-"
+
+    if len(lines) > 1:
+        # A segunda linha geralmente contém a Data da Ocorrência e o Nome do Pagador
+        line_pag = re.sub(r"\d{2}/\d{2}/\d{4}", "", lines[1]).strip()
+        if line_pag and not line_pag.startswith("R$"):
+            pagador = line_pag
+
+    # Identificação de Uso Empresa (ex: LOJA-26-A, CLARICELL, LOJA-28)
+    uso_match = re.search(r"(LOJA-[A-Z0-9\-]+|CLARICELL|[A-Z0-9]{4,10})", block_text)
+    if uso_match and uso_match.group(0) not in pagador:
+        uso_empresa = uso_match.group(0)
+
+    return {
+        "Ocorrência": ocorrencia,
+        "Data Ocorrência": dt_ocorrencia,
+        "Pagador": pagador,
+        "CPF/CNPJ": cpf_cnpj,
+        "Uso da Empresa": uso_empresa,
+        "Data Vencimento": dt_vencimento,
+        "Data Crédito": dt_credito,
+        "Valor Crédito": valor_credito,
+        "Valor Documento": valor_doc,
+    }
+
+
 def gerar_pdf_relatorio(df, beneficiario):
-    """Gera o PDF estilizado com tabela geral e resumo exclusivo de liquidações."""
+    """Gera o PDF estilizado dinamicamente."""
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -95,7 +152,6 @@ def gerar_pdf_relatorio(df, beneficiario):
     elements = []
     styles = getSampleStyleSheet()
 
-    # Estilos customizados
     title_style = ParagraphStyle(
         "TitleStyle",
         parent=styles["Heading1"],
@@ -132,17 +188,8 @@ def gerar_pdf_relatorio(df, beneficiario):
         leading=10,
     )
 
-    cell_center = ParagraphStyle(
-        "CellCenter",
-        parent=cell_style,
-        alignment=1,
-    )
-
-    cell_right = ParagraphStyle(
-        "CellRight",
-        parent=cell_style,
-        alignment=2,
-    )
+    cell_center = ParagraphStyle("CellCenter", parent=cell_style, alignment=1)
+    cell_right = ParagraphStyle("CellRight", parent=cell_style, alignment=2)
 
     cell_header = ParagraphStyle(
         "CellHeader",
@@ -152,23 +199,11 @@ def gerar_pdf_relatorio(df, beneficiario):
         textColor=colors.white,
         leading=10,
     )
-
-    cell_header_center = ParagraphStyle(
-        "CellHeaderCenter",
-        parent=cell_header,
-        alignment=1,
-    )
-
-    cell_header_right = ParagraphStyle(
-        "CellHeaderRight",
-        parent=cell_header,
-        alignment=2,
-    )
+    cell_header_center = ParagraphStyle("CellHeaderCenter", parent=cell_header, alignment=1)
+    cell_header_right = ParagraphStyle("CellHeaderRight", parent=cell_header, alignment=2)
 
     # 1. Cabeçalho Principal
-    elements.append(
-        Paragraph("Relatório de Análise de Retorno Bancário", title_style)
-    )
+    elements.append(Paragraph("Relatório de Análise de Retorno Bancário", title_style))
     elements.append(
         Paragraph(
             f"<b>Beneficiário:</b> {beneficiario} &nbsp;|&nbsp; <b>Banco:</b> TOTAL BANK &nbsp;|&nbsp; <b>Total Títulos:</b> {len(df)}",
@@ -177,70 +212,60 @@ def gerar_pdf_relatorio(df, beneficiario):
     )
     elements.append(Spacer(1, 4))
 
-    # 2. SEÇÃO 1: RESUMO EXCLUSIVO DE LIQUIDAÇÕES
+    # 2. Resumo de Liquidações
     df_liq = df[df["Ocorrência"].str.contains("Liquidação", case=False, na=False)]
 
-    elements.append(
-        Paragraph("📌 1. Resumo Exclusivo de Títulos Liquidados (Pagos)", section_style)
-    )
+    if not df_liq.empty:
+        elements.append(
+            Paragraph("📌 1. Resumo Exclusivo de Títulos Liquidados (Pagos)", section_style)
+        )
 
-    headers_liq = [
-        "Pagador",
-        "Data Ocorrência",
-        "Data Vencimento",
-        "Data Crédito",
-        "Valor Creditado",
-        "Valor Doc. Original",
-    ]
+        headers_liq = [
+            "Pagador", "Data Ocorrência", "Data Vencimento", 
+            "Data Crédito", "Valor Creditado", "Valor Doc. Original"
+        ]
 
-    data_liq = [[
-        Paragraph(f"<b>{headers_liq[0]}</b>", cell_header),
-        Paragraph(f"<b>{headers_liq[1]}</b>", cell_header_center),
-        Paragraph(f"<b>{headers_liq[2]}</b>", cell_header_center),
-        Paragraph(f"<b>{headers_liq[3]}</b>", cell_header_center),
-        Paragraph(f"<b>{headers_liq[4]}</b>", cell_header_right),
-        Paragraph(f"<b>{headers_liq[5]}</b>", cell_header_right),
-    ]]
+        data_liq = [[
+            Paragraph(f"<b>{headers_liq[0]}</b>", cell_header),
+            Paragraph(f"<b>{headers_liq[1]}</b>", cell_header_center),
+            Paragraph(f"<b>{headers_liq[2]}</b>", cell_header_center),
+            Paragraph(f"<b>{headers_liq[3]}</b>", cell_header_center),
+            Paragraph(f"<b>{headers_liq[4]}</b>", cell_header_right),
+            Paragraph(f"<b>{headers_liq[5]}</b>", cell_header_right),
+        ]]
 
-    for _, row in df_liq.iterrows():
-        data_liq.append([
-            Paragraph(f"<b>{row['Pagador']}</b>", cell_style),
-            Paragraph(row["Data Ocorrência"], cell_center),
-            Paragraph(row["Data Vencimento"], cell_center),
-            Paragraph(row["Data Crédito"], cell_center),
-            Paragraph(f"<b>{row['Valor Crédito']}</b>", cell_right),
-            Paragraph(row["Valor Documento"], cell_right),
-        ])
+        for _, row in df_liq.iterrows():
+            data_liq.append([
+                Paragraph(f"<b>{row['Pagador']}</b>", cell_style),
+                Paragraph(row["Data Ocorrência"], cell_center),
+                Paragraph(row["Data Vencimento"], cell_center),
+                Paragraph(row["Data Crédito"], cell_center),
+                Paragraph(f"<b>{row['Valor Crédito']}</b>", cell_right),
+                Paragraph(row["Valor Documento"], cell_right),
+            ])
 
-    t_liq = Table(data_liq, colWidths=[180, 100, 100, 100, 130, 130])
-    t_liq.setStyle(
-        TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#276749")),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#C6F6D5")),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#F0FFF4")]),
-            ("TOPPADDING", (0, 0), (-1, -1), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ])
-    )
-    elements.append(t_liq)
-    elements.append(Spacer(1, 10))
+        t_liq = Table(data_liq, colWidths=[180, 100, 100, 100, 130, 130])
+        t_liq.setStyle(
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#276749")),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#C6F6D5")),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#F0FFF4")]),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ])
+        )
+        elements.append(t_liq)
+        elements.append(Spacer(1, 10))
 
-    # 3. SEÇÃO 2: DETALHAMENTO GERAL DO LOTE
+    # 3. Detalhamento Geral
     elements.append(
         Paragraph("📋 2. Detalhamento Geral de Títulos do Lote", section_style)
     )
 
     headers_geral = [
-        "Ocorrência",
-        "Data Ocorr.",
-        "Pagador",
-        "CPF/CNPJ",
-        "Uso Empresa",
-        "Data Venc.",
-        "Data Crédito",
-        "Valor Crédito",
-        "Valor Doc.",
+        "Ocorrência", "Data Ocorr.", "Pagador", "CPF/CNPJ", 
+        "Uso Empresa", "Data Venc.", "Data Crédito", "Valor Crédito", "Valor Doc."
     ]
 
     data_geral = [[
@@ -275,12 +300,7 @@ def gerar_pdf_relatorio(df, beneficiario):
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2B6CB0")),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E0")),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            (
-                "ROWBACKGROUNDS",
-                (0, 1),
-                (-1, -1),
-                [colors.white, colors.HexColor("#F8FAFC")],
-            ),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
             ("TOPPADDING", (0, 0), (-1, -1), 5),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ])
@@ -294,22 +314,23 @@ def gerar_pdf_relatorio(df, beneficiario):
 
 # Fluxo Principal do Streamlit
 if uploaded_file:
-    with st.spinner("Processando o arquivo e formatando o layout..."):
-        df, beneficiario = parse_totalbank_pdf(uploaded_file)
+    with st.spinner("Lendo o PDF e processando dados..."):
+        df, beneficiario = extract_data_from_pdf(uploaded_file)
 
-    st.success(f"Concluído! {len(df)} registros processados.")
+    st.success(f"Concluído! {len(df)} registros extraídos com sucesso do arquivo atual.")
 
-    # Exibição das Tabelas na Tela
-    st.subheader("📌 Títulos Liquidados (Pagos)")
-    df_liq_screen = df[df["Ocorrência"].str.contains("Liquidação", case=False, na=False)][[
-        "Pagador",
-        "Data Ocorrência",
-        "Data Vencimento",
-        "Data Crédito",
-        "Valor Crédito",
-        "Valor Documento",
-    ]]
-    st.dataframe(df_liq_screen, use_container_width=True)
+    # Exibição na Tela
+    df_liq_screen = df[df["Ocorrência"].str.contains("Liquidação", case=False, na=False)]
+    
+    if not df_liq_screen.empty:
+        st.subheader("📌 Títulos Liquidados (Pagos)")
+        st.dataframe(
+            df_liq_screen[[
+                "Pagador", "Data Ocorrência", "Data Vencimento", 
+                "Data Crédito", "Valor Crédito", "Valor Documento"
+            ]],
+            use_container_width=True,
+        )
 
     st.subheader("📋 Detalhamento Geral do Lote")
     st.dataframe(df, use_container_width=True)
@@ -322,16 +343,15 @@ if uploaded_file:
         st.download_button(
             label="📄 Baixar PDF Executivo",
             data=pdf_bytes,
-            file_name="relatorio_retorno_bancario_premium.pdf",
+            file_name="relatorio_retorno_bancario.pdf",
             mime="application/pdf",
         )
 
     with col2:
         excel_buffer = io.BytesIO()
         with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            df_liq_screen.to_excel(
-                writer, index=False, sheet_name="Liquidações"
-            )
+            if not df_liq_screen.empty:
+                df_liq_screen.to_excel(writer, index=False, sheet_name="Liquidações")
             df.to_excel(writer, index=False, sheet_name="Geral")
         st.download_button(
             label="📊 Baixar Excel (.xlsx)",
@@ -350,4 +370,4 @@ if uploaded_file:
             mime="text/csv",
         )
 else:
-    st.info("Aguardando upload do arquivo PDF do Total Bank...")
+    st.info("Aguardando upload de um arquivo PDF do Total Bank...")
