@@ -65,12 +65,12 @@ def summarize_occurrence(occ_text):
 
 def parse_totalbank_blocks(full_text):
     """
-    Processa o texto completo mantendo a ordem exata de campos por registro
-    baseado no padrão nativo de delimitação do Total Bank.
+    Realiza o parse varrendo linha por linha dentro de cada bloco do Total Bank,
+    garantindo a captura de Pagador e Seu Número independente das barras verticais.
     """
     records = []
     
-    # Divide o documento em blocos a partir de cada nova ocorrência (ex: 06-Liquidação)
+    # Divide o texto completo em blocos por ocorrência (ex: 06-Liquidação)
     raw_blocks = re.split(r"\n(?=\d{2}-[A-Za-zÀ-ÿ])", full_text)
 
     for block in raw_blocks:
@@ -92,33 +92,13 @@ def parse_totalbank_blocks(full_text):
         cnpj_match = re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2}", block)
         cpf_cnpj = cnpj_match.group(0) if cnpj_match else "-"
 
-        # 4. Pagador - Busca direta pelo texto entre a barra e a linha do CNPJ
-        pagador = "-"
-        pag_match = re.search(r"\|\s*([A-Z0-9\s\.\&\-]{3,40})\n\s*\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", block)
-        if pag_match:
-            pagador = pag_match.group(1).strip()
-        else:
-            # Fallback para linha logo abaixo da Ocorrência/Data
-            lines = [l.strip() for l in block.split("\n") if l.strip()]
-            for line in lines:
-                if "|" in line:
-                    parts = [p.strip() for p in line.split("|") if p.strip()]
-                    for p in parts:
-                        if not re.search(r"\d{2}/\d{2}/\d{4}|\d{2}\.\d{3}|R\$|\d{10,}", p) and len(p) > 2:
-                            pagador = p
-                            break
-                if pagador != "-":
-                    break
+        # 4. Imóvel / Uso da Empresa
+        imovel = "-"
+        imovel_match = re.search(r"\b(LOJA[-\s]?\d+[A-Z]?|SALAS?|SHOPPING|CLARICELL)\b", block, re.IGNORECASE)
+        if imovel_match:
+            imovel = imovel_match.group(0).upper()
 
-        # 5. Seu Número - Busca número curto (1 a 6 dígitos) localizado logo após o Nosso Número longo
-        seu_numero = "-"
-        sn_match = re.search(r"\d{12,18}\s*\n\s*(\d{1,6})\b", block)
-        if not sn_match:
-            sn_match = re.search(r"\|\s*\d{12,18}\s*(\d{1,6})\b", block)
-        if sn_match:
-            seu_numero = sn_match.group(1)
-
-        # 6. Forma de Pagamento
+        # 5. Forma de Pagamento
         forma_pag = "-"
         if "Cartão de crédito/Dinheiro" in block:
             forma_pag = "Cartão de crédito/Dinheiro"
@@ -129,11 +109,49 @@ def parse_totalbank_blocks(full_text):
         elif "PIX" in block or "Pix" in block:
             forma_pag = "PIX"
 
-        # 7. Imóvel / Uso da Empresa
-        imovel = "-"
-        imovel_match = re.search(r"\b(LOJA[-\s]?\d+[A-Z]?|SALAS?|SHOPPING|CLARICELL)\b", block, re.IGNORECASE)
-        if imovel_match:
-            imovel = imovel_match.group(0).upper()
+        # 6. Seu Número
+        # Captura sequências curtas (1-6 dígitos) presentes nas linhas de Nosso Número / Seu Número
+        seu_numero = "-"
+        sn_patterns = [
+            r"\b140000000\d{8}\s+(\d{1,6})\b",
+            r"\|\s*140000000\d{8}\s*\|\s*(\d{1,6})\b",
+            r"\b(\d{1,6})\s*\n\s*\|\s*Cartão",
+            r"\|\s*(\d{3,5})\s*\|\s*Cartão"
+        ]
+        for pat in sn_patterns:
+            sn_m = re.search(pat, block)
+            if sn_m:
+                seu_numero = sn_m.group(1)
+                break
+
+        # 7. Pagador (Varredura inteligente de texto)
+        pagador = "-"
+        lines = [l.strip() for l in block.split("\n") if l.strip()]
+        
+        for line in lines:
+            # Despreza linhas com cabeçalhos, totais ou termos do sistema
+            if any(term in line.lower() for term in [
+                "ocorrencia", "nosso número", "canal", "valor", "resumo", "totais", "retorno enviado"
+            ]):
+                continue
+
+            # Se a linha contiver o símbolo |, analisa os fragmentos
+            fragments = [f.strip() for f in line.split("|") if f.strip()]
+            for frag in fragments:
+                # Remove caracteres de formatação
+                clean_frag = re.sub(r"^\d{2}/\d{2}/\d{4}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|R\$[\d\.\,]+", "", frag).strip()
+                
+                # O pagador deve ter mais de 2 letras e não ser apenas números/datas/imóveis
+                if (
+                    len(clean_frag) >= 3 
+                    and not re.match(r"^[\d\s\.\,\/\-]+$", clean_frag)
+                    and clean_frag not in [imovel, forma_pag, ocorrencia]
+                ):
+                    pagador = clean_frag
+                    break
+            
+            if pagador != "-":
+                break
 
         # 8. Valores (Tarifa, Pago, Original)
         raw_values = re.findall(r"R\$\s*[\d\.]+\,\d{2}", block)
@@ -413,9 +431,9 @@ def gerar_pdf_relatorio(df, beneficiario, totais_pdf):
     return buffer
 
 
-# Fluxo Principal Streamlit
+# Interface Principal Streamlit
 if uploaded_file:
-    with st.spinner("Lendo o PDF e processando com o extrator ajustado..."):
+    with st.spinner("Lendo o PDF e processando os pagadores de forma precisa..."):
         df, beneficiario, totais_pdf = extract_data_from_pdf(uploaded_file)
 
     st.success(f"Concluído! {len(df)} registros extraídos com sucesso.")
