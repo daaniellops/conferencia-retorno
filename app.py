@@ -1,184 +1,61 @@
-import io
-import re
-import pandas as pd
-import pdfplumber
-import streamlit as st
+# PROMPT DE DESENVOLVIMENTO: Gerador de Relatório PDF de Retorno Bancário
 
-# Configuração da página do Streamlit
-st.set_page_config(
-    page_title="Extrator de Títulos - Total Bank",
-    page_icon="📊",
-    layout="wide",
+Você é um desenvolvedor Python sênior especializado em automação financeira e geração de relatórios corporativos.
+
+## OBJETIVO
+Desenvolver/atualizar o código no repositório do GitHub para que, após processar o PDF de retorno do Total Bank, o sistema gere automaticamente um **Relatório PDF formatado e estilizado**, pronto para download ou envio por e-mail.
+
+---
+
+## 1. CAMPOS OBRIGATÓRIOS DO RELATÓRIO PDF
+
+O relatório em PDF deve conter obrigatoriamente os seguintes campos extraídos do arquivo de retorno:
+
+1. **Cabeçalho Executivo**:
+   - **Beneficiário**: Razão Social constante no relatório (ex: ASSOCIACAO DOS LOJISTAS DO ITA SHOPPING CENTRO-RATEIO).
+   - **Banco Emissor**: Total Bank
+   - **Data do Processamento**: Data de extração/emissão do relatório (DD/MM/AAAA).
+   - **Total de Registros Analisados**: Quantidade total de títulos no lote.
+
+2. **Tabela Detalhada dos Títulos**:
+   - **Ocorrência**: Descrição/Código da ocorrência (ex: `06-Liquidação`, `02-Entrada Confirmada`, `45-Alteração de Dados`, `28-Débito de Tarifas/Custas`).
+   - **Data da Ocorrência**: Data em que ocorreu o registro.
+   - **Pagador**: Nome / Razão Social do Pagador.
+   - **CPF/CNPJ**: Número do documento do pagador.
+   - **Uso da Empresa**: Código de identificação interno (ex: `LOJA-26-A`, `CLARICELL`).
+   - **Data de Vencimento**: Data de vencimento original do título.
+   - **Data Crédito**: Data de entrada do valor na conta (se houver; caso contrário, indicar `-`).
+   - **Valor Crédito**: Valor efetivamente pago/creditado em conta (R$).
+   - **Valor Documento**: Valor original do documento/título (R$).
+
+3. **Tabela de Resumo e Consolidação Financeira (Rodapé do Relatório)**:
+   - Agrupamento dos títulos por **Tipo de Ocorrência** com a quantidade de títulos em cada tipo.
+   - **Soma Total do Valor Crédito (R$)** e **Soma Total do Valor Documento (R$)**.
+   - Linha de **TOTAL GERAL DO LOTE**.
+
+---
+
+## 2. REQUISITOS TÉCNICOS E FORMATAÇÃO (PDF)
+
+- **Biblioteca Recomendada**: Utilize `reportlab` (ou `FPDF2`) em Python para gerar o PDF via buffer em memória (`io.BytesIO`).
+- **Design & Paleta de Cores**:
+  - Estilo corporativo com tons de azul escuro (`#1A365D`) nos títulos e azul primário (`#2B6CB0`) nos cabeçalhos de tabela.
+  - Linhas zebradas (fundo claro alternado `#F8FAFC`) para facilitar a leitura.
+  - Fonte padrão clara e legível (Helvetica / Arial), com margens de 15 a 20mm.
+- **Valores Monetários e Ausentes**:
+  - Todos os valores numéricos devem estar formatados no padrão brasileiro (`R$ X.XXX,XX`).
+  - Campos não informados (como Data de Crédito em títulos pendentes) devem ser exibidos como `-` ou `N/A`.
+
+---
+
+## 3. INTEGRAÇÃO NO STREAMLIT (`app.py`)
+
+Adicione ao script do aplicativo um botão dedicado para a exportação do PDF:
+
+```python
+st.download_button(
+    label="📄 Baixar Relatório Completo em PDF",
+    data=pdf_bytes,
+    file_name="Relatorio_Retorno_Bancario_TotalBank.pdf",
+    mime="application/pdf",
 )
-
-st.title("📊 Extrator & Conciliador de Títulos - Total Bank")
-st.markdown(
-    "Faça o upload do relatório PDF do Total Bank para estruturar os dados de ocorrência, pagador, valores e datas."
-)
-
-uploaded_file = st.file_uploader(
-    "Selecione o arquivo PDF do Total Bank", type=["pdf"]
-)
-
-
-def parse_totalbank_pdf(pdf_file):
-    """Extrai os dados estruturados do PDF do Total Bank."""
-    records = []
-
-    with pdfplumber.open(pdf_file) as pdf:
-        full_text = ""
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                full_text += text + "\n"
-
-    # Expressões regulares para captura dos campos
-    pattern_ocorrencia = re.compile(
-        r"^(\d{2}-[A-Za-zÀ-ÿ\s/]+)", re.MULTILINE
-    )
-
-    # Divide por linhas para processamento sequencial
-    lines = [
-        line.strip() for line in full_text.split("\n") if line.strip()
-    ]
-
-    current_record = None
-
-    for line in lines:
-        # Detecta início de uma nova Ocorrência (ex: 06-Liquidação, 02-Entrada Confirmada, etc.)
-        match_occ = re.match(
-            r"^(\d{2}-[A-Za-zÀ-ÿ\s/]+)", line
-        )
-
-        # Evita capturar linhas de resumo como novas ocorrências
-        if match_occ and not line.startswith("Resumo da ocorrência"):
-            if current_record:
-                records.append(current_record)
-
-            current_record = {
-                "Ocorrência": match_occ.group(1).strip(),
-                "Data Ocorrência": "",
-                "Pagador": "",
-                "CPF/CNPJ": "",
-                "Uso da Empresa": "",
-                "Data Vencimento": "",
-                "Data Crédito": "",
-                "Valor Crédito": "R$ 0,00",
-                "Valor Documento": "R$ 0,00",
-            }
-            continue
-
-        if current_record:
-            # Captura CPF / CNPJ
-            doc_match = re.search(
-                r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b|\b\d{3}\.\d{3}\.\d{3}-\d{2}\b",
-                line,
-            )
-            if doc_match and not current_record["CPF/CNPJ"]:
-                current_record["CPF/CNPJ"] = doc_match.group(0)
-
-            # Captura Datas (DD/MM/AAAA)
-            dates = re.findall(r"\b\d{2}/\d{2}/\d{4}\b", line)
-            if dates:
-                if not current_record["Data Ocorrência"]:
-                    current_record["Data Ocorrência"] = dates[0]
-                elif not current_record["Data Vencimento"]:
-                    current_record["Data Vencimento"] = dates[0]
-                    if len(dates) > 1 and not current_record["Data Crédito"]:
-                        current_record["Data Crédito"] = dates[1]
-                elif not current_record["Data Crédito"]:
-                    current_record["Data Crédito"] = dates[0]
-
-            # Captura Identificadores de Uso da Empresa (ex: LOJA-26-A, CLARICELL, LOJA-28)
-            uso_match = re.search(
-                r"\b(LOJA-[A-Za-z0-9-]+|CLARICELL|[A-Z0-9_-]{4,15})\b", line
-            )
-            if (
-                uso_match
-                and not current_record["Uso da Empresa"]
-                and uso_match.group(0)
-                not in ["TOTAL", "BANK", "NSA", "DROGARIA", "SANZITO"]
-            ):
-                current_record["Uso da Empresa"] = uso_match.group(0)
-
-            # Captura Nome do Pagador
-            if not current_record["Pagador"]:
-                for name in [
-                    "DROGARIA",
-                    "ADMCENTER COBRANCA",
-                    "SANZITO",
-                    "ASSOCIACAO DOS LOJISTAS",
-                ]:
-                    if name in line:
-                        current_record["Pagador"] = name
-                        break
-
-            # Captura Valores em Reais (R$ X.XXX,XX)
-            vals = re.findall(
-                r"R\$\s*[\d\.]+(?:,\d{2})?", line
-            )
-            if vals:
-                if (
-                    "R$ 3.807,48" in line
-                    and current_record["Ocorrência"] == "06-Liquidação"
-                ):
-                    current_record["Valor Crédito"] = "R$ 3.807,48"
-                    current_record["Valor Documento"] = "R$ 3.807,48"
-                elif (
-                    "R$ 4.621,43" in line
-                    or "R$ 4.621.43" in line
-                ) and current_record["Ocorrência"] == "02-Entrada Confirmada":
-                    current_record["Valor Documento"] = "R$ 4.621,43"
-                elif (
-                    "R$ 13.991,97" in line
-                    and current_record["Ocorrência"] == "45-Alteração de Dados"
-                ):
-                    current_record["Valor Documento"] = "R$ 13.991,97"
-
-    if current_record:
-        records.append(current_record)
-
-    df = pd.DataFrame(records)
-
-    # Tratamento para valores nulos/vazios
-    df.fillna("N/A", inplace=True)
-    df.replace("", "N/A", inplace=True)
-
-    return df
-
-
-if uploaded_file:
-    with st.spinner("Lendo e processando o PDF..."):
-        df = parse_totalbank_pdf(uploaded_file)
-
-    st.success(f"Processamento concluído! {len(df)} registros encontrados.")
-
-    # Exibição dos dados
-    st.subheader("📋 Tabela Estruturada de Títulos")
-    st.dataframe(df, use_container_width=True)
-
-    # Botões de Exportação
-    col1, col2 = st.columns(2)
-
-    with col1:
-        csv_buffer = io.StringIO()
-        df.to_csv(csv_buffer, index=False, sep=";")
-        st.download_button(
-            label="📥 Baixar como CSV (para Excel)",
-            data=csv_buffer.getvalue(),
-            file_name="relatorio_titulos_totalbank.csv",
-            mime="text/csv",
-        )
-
-    with col2:
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Títulos")
-        st.download_button(
-            label="📊 Baixar como Excel (.xlsx)",
-            data=excel_buffer.getvalue(),
-            file_name="relatorio_titulos_totalbank.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-else:
-    st.info("Aguardando upload do arquivo PDF...")
