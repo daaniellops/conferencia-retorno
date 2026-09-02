@@ -63,27 +63,18 @@ def summarize_occurrence(occ_text):
 
 
 def extract_exact_pagador(block_text):
-    """
-    Extrai estritamente o Nome do Pagador.
-    O nome fica localizado logo após a Ocorrência (ex: 06-Liquidação) 
-    e antes do Nosso Número / Números de Documentos.
-    """
-    # 1. Procura texto entre Ocorrência e a sequência do Nosso Número (iniciando por 1400...)
+    """Extrai estritamente o Nome do Pagador."""
     match = re.search(r"\d{2}-[A-Za-zÀ-ÿ]+\s+([A-Za-z0-9\s\.\&\-\/]+?)\s+\d{10,18}", block_text)
     if match:
         pagador = match.group(1).strip()
-        # Limpa termos de cabeçalho residuais caso o layout tenha mesclado a linha superior
         pagador = re.sub(r"(?i)\b(pagador|nosso|número|numero|canal|valor|ocorrencia)\b", "", pagador).strip()
         if pagador:
             return pagador
 
-    # 2. Fallback por captura de linha limpa sem termos de sistema e sem números isolados
     lines = [l.strip() for l in block_text.split("\n") if l.strip()]
     for line in lines:
         if re.search(r"^\d{2}-[A-Za-zÀ-ÿ]+", line):
-            # Remove a ocorrencia
             line_clean = re.sub(r"^\d{2}-[A-Za-zÀ-ÿ]+", "", line).strip()
-            # Remove o Nosso Número e restante da linha
             line_clean = re.sub(r"\d{10,18}.*", "", line_clean).strip()
             if len(line_clean) >= 2 and not re.match(r"^[\d\s\.\,\/\-]+$", line_clean):
                 return line_clean
@@ -100,31 +91,25 @@ def parse_totalbank_blocks(full_text):
         if not re.match(r"^\s*\d{2}-", block):
             continue
 
-        # 1. Ocorrência
         occ_match = re.search(r"^(\d{2}-[A-Za-zÀ-ÿ]+)", block)
         ocorrencia_str = occ_match.group(1) if occ_match else "-"
         ocorrencia = summarize_occurrence(ocorrencia_str)
 
-        # 2. Pagador Exato
         pagador = extract_exact_pagador(block)
 
-        # 3. Datas (Ocorrência, Vencimento, Crédito)
         dates = re.findall(r"\b\d{2}/\d{2}/\d{4}\b", block)
         dt_ocorrencia = dates[0] if len(dates) > 0 else "-"
         dt_vencimento = dates[1] if len(dates) > 1 else "-"
         dt_credito = dates[2] if len(dates) > 2 else (dates[1] if len(dates) > 1 else "-")
 
-        # 4. CPF / CNPJ
         cnpj_match = re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2}", block)
         cpf_cnpj = cnpj_match.group(0) if cnpj_match else "-"
 
-        # 5. Imóvel
         imovel = "-"
         imovel_match = re.search(r"\b(LOJA[-\s]?\d+[A-Z]?|SALAS?|SHOPPING|CLARICELL)\b", block, re.IGNORECASE)
         if imovel_match:
             imovel = imovel_match.group(0).upper()
 
-        # 6. Forma de Pagamento
         forma_pag = "-"
         if "Cartão de crédito/Dinheiro" in block:
             forma_pag = "Cartão de crédito/Dinheiro"
@@ -135,13 +120,11 @@ def parse_totalbank_blocks(full_text):
         elif "PIX" in block or "Pix" in block:
             forma_pag = "PIX"
 
-        # 7. Seu Número
         seu_numero = "-"
         sn_match = re.search(r"\b\d{12,18}\s+(\d{1,6})\b", block)
         if sn_match:
             seu_numero = sn_match.group(1)
 
-        # 8. Valores
         raw_values = re.findall(r"R\$\s*[\d\.]+\,\d{2}", block)
         vals = [clean_currency(v) for v in raw_values]
 
@@ -243,6 +226,11 @@ def gerar_pdf_relatorio(df, beneficiario, totais_pdf):
     cell_header_center = ParagraphStyle("CellHeaderCenter", parent=cell_header, alignment=1)
     cell_header_right = ParagraphStyle("CellHeaderRight", parent=cell_header, alignment=2)
 
+    cell_total = ParagraphStyle(
+        "CellTotal", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7, textColor=colors.HexColor("#1A365D"), leading=9
+    )
+    cell_total_right = ParagraphStyle("CellTotalRight", parent=cell_total, alignment=2)
+
     elements.append(Paragraph("Relatório de Análise de Retorno Bancário", title_style))
     elements.append(
         Paragraph(
@@ -281,15 +269,35 @@ def gerar_pdf_relatorio(df, beneficiario, totais_pdf):
                 Paragraph(row["Valor Original"], cell_right),
             ])
 
+        # Adiciona a linha de totais dos liquidados
+        tot_liq_pago = df_liq["_num_pago"].sum()
+        tot_liq_orig = df_liq["_num_original"].sum()
+
+        data_liq.append([
+            Paragraph("<b>TOTAL LIQUIDADO</b>", cell_total),
+            Paragraph("", cell_total),
+            Paragraph("", cell_total),
+            Paragraph("", cell_total),
+            Paragraph("", cell_total),
+            Paragraph("", cell_total),
+            Paragraph(f"<b>{format_currency(tot_liq_pago)}</b>", cell_total_right),
+            Paragraph(f"<b>{format_currency(tot_liq_orig)}</b>", cell_total_right),
+        ])
+
         t_liq = Table(data_liq, colWidths=[75, 55, 230, 75, 60, 60, 105, 105])
-        t_liq.setStyle(TableStyle([
+        
+        # Estilo incluindo destaque para a linha final de total
+        t_liq_style = [
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#276749")),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#C6F6D5")),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#F0FFF4")]),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.HexColor("#F0FFF4")]),
+            ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#C6F6D5")),
             ("TOPPADDING", (0, 0), (-1, -1), 3),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ]))
+        ]
+        
+        t_liq.setStyle(TableStyle(t_liq_style))
         elements.append(t_liq)
         elements.append(Spacer(1, 6))
 
@@ -364,7 +372,7 @@ def gerar_pdf_relatorio(df, beneficiario, totais_pdf):
 
 
 if uploaded_file:
-    with st.spinner("Extraindo os nomes dos pagadores com precisão..."):
+    with st.spinner("Extraindo dados e gerando os totais de liquidação..."):
         df, beneficiario, totais_pdf = extract_data_from_pdf(uploaded_file)
 
     st.success(f"Concluído! {len(df)} registros extraídos.")
