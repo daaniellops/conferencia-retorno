@@ -17,7 +17,7 @@ st.set_page_config(
 
 st.title("📊 Extrator & Conciliador de Retorno Bancário - Total Bank")
 st.markdown(
-    "Upload de arquivos de retorno do Total Bank com extração corrigida de Pagador, Seu Número e Imóvel."
+    "Upload de arquivos de retorno do Total Bank com extração corrigida de Pagador e Seu Número."
 )
 
 uploaded_file = st.file_uploader(
@@ -63,9 +63,119 @@ def summarize_occurrence(occ_text):
     return clean.split()[0] if clean else occ_text
 
 
-def extract_data_from_pdf(pdf_file):
-    """Lê o PDF garantindo a extração isolada e correta de cada campo."""
+def parse_totalbank_blocks(full_text):
+    """
+    Processa o texto completo mantendo a ordem exata de campos por registro
+    baseado no padrão nativo de delimitação do Total Bank.
+    """
     records = []
+    
+    # Divide o documento em blocos a partir de cada nova ocorrência (ex: 06-Liquidação)
+    raw_blocks = re.split(r"\n(?=\d{2}-[A-Za-zÀ-ÿ])", full_text)
+
+    for block in raw_blocks:
+        if not re.match(r"^\s*\d{2}-", block):
+            continue
+
+        # 1. Ocorrência
+        occ_match = re.search(r"^(\d{2}-[A-Za-zÀ-ÿ]+)", block)
+        ocorrencia_str = occ_match.group(1) if occ_match else "-"
+        ocorrencia = summarize_occurrence(ocorrencia_str)
+
+        # 2. Datas (Ocorrência, Vencimento, Crédito)
+        dates = re.findall(r"\b\d{2}/\d{2}/\d{4}\b", block)
+        dt_ocorrencia = dates[0] if len(dates) > 0 else "-"
+        dt_vencimento = dates[1] if len(dates) > 1 else "-"
+        dt_credito = dates[2] if len(dates) > 2 else (dates[1] if len(dates) > 1 else "-")
+
+        # 3. CPF / CNPJ
+        cnpj_match = re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2}", block)
+        cpf_cnpj = cnpj_match.group(0) if cnpj_match else "-"
+
+        # 4. Pagador - Busca direta pelo texto entre a barra e a linha do CNPJ
+        pagador = "-"
+        pag_match = re.search(r"\|\s*([A-Z0-9\s\.\&\-]{3,40})\n\s*\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", block)
+        if pag_match:
+            pagador = pag_match.group(1).strip()
+        else:
+            # Fallback para linha logo abaixo da Ocorrência/Data
+            lines = [l.strip() for l in block.split("\n") if l.strip()]
+            for line in lines:
+                if "|" in line:
+                    parts = [p.strip() for p in line.split("|") if p.strip()]
+                    for p in parts:
+                        if not re.search(r"\d{2}/\d{2}/\d{4}|\d{2}\.\d{3}|R\$|\d{10,}", p) and len(p) > 2:
+                            pagador = p
+                            break
+                if pagador != "-":
+                    break
+
+        # 5. Seu Número - Busca número curto (1 a 6 dígitos) localizado logo após o Nosso Número longo
+        seu_numero = "-"
+        sn_match = re.search(r"\d{12,18}\s*\n\s*(\d{1,6})\b", block)
+        if not sn_match:
+            sn_match = re.search(r"\|\s*\d{12,18}\s*(\d{1,6})\b", block)
+        if sn_match:
+            seu_numero = sn_match.group(1)
+
+        # 6. Forma de Pagamento
+        forma_pag = "-"
+        if "Cartão de crédito/Dinheiro" in block:
+            forma_pag = "Cartão de crédito/Dinheiro"
+        elif "Cartão" in block or "Dinheiro" in block:
+            forma_pag = "Cartão / Dinheiro"
+        elif "DDA" in block:
+            forma_pag = "DDA"
+        elif "PIX" in block or "Pix" in block:
+            forma_pag = "PIX"
+
+        # 7. Imóvel / Uso da Empresa
+        imovel = "-"
+        imovel_match = re.search(r"\b(LOJA[-\s]?\d+[A-Z]?|SALAS?|SHOPPING|CLARICELL)\b", block, re.IGNORECASE)
+        if imovel_match:
+            imovel = imovel_match.group(0).upper()
+
+        # 8. Valores (Tarifa, Pago, Original)
+        raw_values = re.findall(r"R\$\s*[\d\.]+\,\d{2}", block)
+        vals = [clean_currency(v) for v in raw_values]
+
+        v_tarifa = 0.0
+        v_pago = 0.0
+        v_original = 0.0
+
+        if len(vals) >= 4:
+            v_tarifa = vals[0]
+            v_pago = vals[2]
+            v_original = vals[3]
+        elif len(vals) >= 2:
+            v_pago = vals[0]
+            v_original = vals[-1]
+        elif len(vals) == 1:
+            v_pago = vals[0]
+            v_original = vals[0]
+
+        records.append({
+            "Ocorrência": ocorrencia,
+            "Data Ocorrência": dt_ocorrencia,
+            "Pagador": pagador,
+            "CPF/CNPJ": cpf_cnpj,
+            "Seu Número": seu_numero,
+            "Forma Pagamento": forma_pag,
+            "Imóvel": imovel,
+            "Data Vencimento": dt_vencimento,
+            "Data Crédito": dt_credito,
+            "Valor Pago": format_currency(v_pago),
+            "Valor Original": format_currency(v_original),
+            "_num_tarifa": v_tarifa,
+            "_num_pago": v_pago,
+            "_num_original": v_original,
+        })
+
+    return records
+
+
+def extract_data_from_pdf(pdf_file):
+    """Extrai os dados do PDF."""
     beneficiario = "NÃO IDENTIFICADO"
     totais_pdf = {"tarifas": 0.0, "credito": 0.0, "pago": 0.0, "doc": 0.0}
 
@@ -81,23 +191,7 @@ def extract_data_from_pdf(pdf_file):
     if match_ben:
         beneficiario = match_ben.group(1).split("NSA:")[0].split("Status:")[0].strip()
 
-    # Separa por blocos numéricos (06-Liquidação, 09-Baixa, etc.)
-    raw_blocks = re.split(r"\n(?=\d{2}-[A-Za-zÀ-ÿ])", full_text)
-
-    for block in raw_blocks:
-        if "Resumo da ocorrência" in block or "Totais para este filtro" in block:
-            vals = re.findall(r"R\$\s*[\d\.]+\,\d{2}", block)
-            if len(vals) >= 4:
-                totais_pdf["tarifas"] += clean_currency(vals[0])
-                totais_pdf["credito"] += clean_currency(vals[1])
-                totais_pdf["pago"] += clean_currency(vals[2])
-                totais_pdf["doc"] += clean_currency(vals[3])
-            continue
-
-        item = parse_single_block(block)
-        if item:
-            records.append(item)
-
+    records = parse_totalbank_blocks(full_text)
     df = pd.DataFrame(records)
 
     if df.empty:
@@ -110,90 +204,8 @@ def extract_data_from_pdf(pdf_file):
     return df, beneficiario, totais_pdf
 
 
-def parse_single_block(block_text):
-    """Processa 1 registro individual do PDF de forma precisa."""
-    lines = [l.strip() for l in block_text.split("\n") if l.strip()]
-    if not lines or not re.match(r"^\d{2}-", lines[0]):
-        return None
-
-    # 1. Ocorrência
-    ocorrencia_resumida = summarize_occurrence(lines[0])
-
-    # 2. CPF / CNPJ
-    cnpj_match = re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2}", block_text)
-    cpf_cnpj = cnpj_match.group(0) if cnpj_match else "-"
-
-    # 3. Imóvel / Uso da Empresa (ex: LOJA-13, LOJA-28, CLARICELL)
-    imovel_match = re.search(r"\b(LOJA[-\s]?\d+[A-Z]?|SALAS?|SHOPPING|CLARICELL)\b", block_text, re.IGNORECASE)
-    imovel = imovel_match.group(0).upper() if imovel_match else "-"
-
-    # 4. Forma de Pagamento
-    forma_pag = "-"
-    if "Cartão de crédito/Dinheiro" in block_text:
-        forma_pag = "Cartão de crédito/Dinheiro"
-    elif "Cartão" in block_text or "Dinheiro" in block_text:
-        forma_pag = "Cartão / Dinheiro"
-    elif "DDA" in block_text:
-        forma_pag = "DDA"
-    elif "PIX" in block_text or "Pix" in block_text:
-        forma_pag = "PIX"
-
-    # 5. Datas (dd/mm/aaaa)
-    dates = re.findall(r"\b\d{2}/\d{2}/\d{4}\b", block_text)
-    dt_ocorrencia = dates[0] if len(dates) > 0 else "-"
-    dt_vencimento = dates[1] if len(dates) > 1 else "-"
-    dt_credito = dates[2] if len(dates) > 2 else "-"
-
-    # 6. Valores Monetários (R$)
-    raw_values = re.findall(r"R\$\s*[\d\.]+\,\d{2}", block_text)
-    vals = [clean_currency(v) for v in raw_values]
-
-    v_tarifa = vals[0] if len(vals) >= 4 else 0.0
-    v_pago = vals[2] if len(vals) >= 4 else (vals[0] if vals else 0.0)
-    v_original = vals[3] if len(vals) >= 4 else (vals[-1] if vals else 0.0)
-
-    # 7. Pagador & Seu Número Isolados Correta e Rigorosamente
-    pagador = "-"
-    seu_numero = "-"
-
-    # Captura Seu Número: número de 1 a 6 dígitos após o Nosso Número de 17 dígitos
-    match_sn = re.search(r"140000000\d{8}\s+(\d{1,6})\b", block_text)
-    if match_sn:
-        seu_numero = match_sn.group(1)
-
-    # Captura o Pagador limpando datas, CNPJs, imóveis e valores do texto
-    for line in lines[1:]:
-        if re.search(r"^\d{2}/\d{2}/\d{4}", line):
-            # Ex: "11/08/2026 | PLANET CELL" -> pega "PLANET CELL"
-            parts = re.split(r"\d{2}/\d{2}/\d{4}", line)
-            if len(parts) > 1:
-                candidate = parts[-1].replace("|", "").strip()
-                # Remove se houver resíduos de CNPJ/Valores
-                candidate = re.sub(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|R\$|\d{3}\.\d{3}\.\d{3}-\d{2}", "", candidate).strip()
-                if candidate and len(candidate) > 2:
-                    pagador = candidate
-                    break
-
-    return {
-        "Ocorrência": ocorrencia_resumida,
-        "Data Ocorrência": dt_ocorrencia,
-        "Pagador": pagador,
-        "CPF/CNPJ": cpf_cnpj,
-        "Seu Número": seu_numero,
-        "Forma Pagamento": forma_pag,
-        "Imóvel": imovel,
-        "Data Vencimento": dt_vencimento,
-        "Data Crédito": dt_credito,
-        "Valor Pago": format_currency(v_pago),
-        "Valor Original": format_currency(v_original),
-        "_num_tarifa": v_tarifa,
-        "_num_pago": v_pago,
-        "_num_original": v_original,
-    }
-
-
 def gerar_pdf_relatorio(df, beneficiario, totais_pdf):
-    """Gera o PDF com dimensões e fontes ajustadas sem truncamento de texto."""
+    """Gera o relatório em PDF."""
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -257,7 +269,7 @@ def gerar_pdf_relatorio(df, beneficiario, totais_pdf):
     cell_header_center = ParagraphStyle("CellHeaderCenter", parent=cell_header, alignment=1)
     cell_header_right = ParagraphStyle("CellHeaderRight", parent=cell_header, alignment=2)
 
-    # Header
+    # Cabeçalho
     elements.append(Paragraph("Relatório de Análise de Retorno Bancário", title_style))
     elements.append(
         Paragraph(
@@ -266,7 +278,7 @@ def gerar_pdf_relatorio(df, beneficiario, totais_pdf):
         )
     )
 
-    # 1. RESUMO EXCLUSIVO DE LIQUIDAÇÕES
+    # 1. TÍTULOS LIQUIDADOS
     df_liq = df[df["Ocorrência"].str.contains("Liquidação", case=False, na=False)]
 
     if not df_liq.empty:
@@ -317,7 +329,7 @@ def gerar_pdf_relatorio(df, beneficiario, totais_pdf):
         elements.append(t_liq)
         elements.append(Spacer(1, 6))
 
-    # 2. DETALHAMENTO GERAL DO LOTE
+    # 2. DETALHAMENTO GERAL
     elements.append(
         Paragraph("📋 2. Detalhamento Geral de Títulos do Lote", section_style)
     )
@@ -370,7 +382,7 @@ def gerar_pdf_relatorio(df, beneficiario, totais_pdf):
     elements.append(t_geral)
     elements.append(Spacer(1, 8))
 
-    # 3. TOTAIS CONSOLIDADOS
+    # TOTAIS
     tot_tarifa = df["_num_tarifa"].sum() if "_num_tarifa" in df else totais_pdf["tarifas"]
     tot_pago = df["_num_pago"].sum() if "_num_pago" in df else totais_pdf["pago"]
     tot_original = df["_num_original"].sum() if "_num_original" in df else totais_pdf["doc"]
@@ -401,9 +413,9 @@ def gerar_pdf_relatorio(df, beneficiario, totais_pdf):
     return buffer
 
 
-# Interface do Streamlit
+# Fluxo Principal Streamlit
 if uploaded_file:
-    with st.spinner("Lendo o PDF e ajustando colunas..."):
+    with st.spinner("Lendo o PDF e processando com o extrator ajustado..."):
         df, beneficiario, totais_pdf = extract_data_from_pdf(uploaded_file)
 
     st.success(f"Concluído! {len(df)} registros extraídos com sucesso.")
